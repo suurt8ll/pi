@@ -442,9 +442,9 @@ function appendCustomToolCallInput(block: StreamingToolCall, nextInput: string, 
 }
 
 type ResponsesOutputSlot =
-	| { type: "thinking"; block: ThinkingContent; contentIndex: number }
-	| { type: "text"; block: TextContent; contentIndex: number }
-	| { type: "toolCall"; block: StreamingToolCall; contentIndex: number };
+	| { type: "thinking"; block: ThinkingContent; contentIndex: number; outputIndex: number }
+	| { type: "text"; block: TextContent; contentIndex: number; outputIndex: number }
+	| { type: "toolCall"; block: StreamingToolCall; contentIndex: number; outputIndex: number };
 
 type ToolCallOutputSlot = Extract<ResponsesOutputSlot, { type: "toolCall" }>;
 
@@ -457,18 +457,30 @@ export async function processResponsesStream<TApi extends Api>(
 ): Promise<void> {
 	let sawTerminalResponseEvent = false;
 	const outputSlots = new Map<number, ResponsesOutputSlot>();
+	// Some providers (e.g. Venice.ai) omit output_index on delta and
+	// output_item.done events, carrying only item_id. Keep a second index so
+	// slots can be resolved by item id for those events.
+	const slotsByItemId = new Map<string, ResponsesOutputSlot>();
 	const reasoningBlocksById = new Map<string, ThinkingContent>();
 	const applyMessagePhaseStopReason = (item: ResponseOutputItem): void => {
 		if (item.type === "message" && item.phase === "final_answer") {
 			output.stopReason = "stop";
 		}
 	};
-	const getSlot = <TType extends ResponsesOutputSlot["type"]>(
-		outputIndex: number,
+	const getSlotForEvent = <TType extends ResponsesOutputSlot["type"]>(
+		event: { output_index?: number; item_id?: string; item?: { id?: string } },
 		type: TType,
 	): Extract<ResponsesOutputSlot, { type: TType }> | undefined => {
-		const slot = outputSlots.get(outputIndex);
-		return slot?.type === type ? (slot as Extract<ResponsesOutputSlot, { type: TType }>) : undefined;
+		// Exact match first, including events that consistently omit output_index
+		// (slots then share the undefined key). Note Map.get(undefined) is valid.
+		const slot = outputSlots.get(event.output_index as number);
+		if (slot?.type === type) return slot as Extract<ResponsesOutputSlot, { type: TType }>;
+		const itemId = event.item_id ?? event.item?.id;
+		if (itemId !== undefined) {
+			const slotById = slotsByItemId.get(itemId);
+			if (slotById?.type === type) return slotById as Extract<ResponsesOutputSlot, { type: TType }>;
+		}
+		return undefined;
 	};
 	const pushToolCallDelta = (slot: ToolCallOutputSlot, delta: string | undefined): void => {
 		if (delta === undefined) return;
@@ -487,18 +499,26 @@ export async function processResponsesStream<TApi extends Api>(
 				type: "thinking",
 				block,
 				contentIndex: output.content.length - 1,
+				outputIndex,
 			} satisfies ResponsesOutputSlot;
 			outputSlots.set(outputIndex, slot);
 			stream.push({ type: "thinking_start", contentIndex: slot.contentIndex, partial: output });
+			if (item.id !== undefined) slotsByItemId.set(item.id, slot);
 			return slot;
 		}
 		if (item.type === "message") {
 			applyMessagePhaseStopReason(item);
 			const block: TextContent = { type: "text", text: "" };
 			output.content.push(block);
-			const slot = { type: "text", block, contentIndex: output.content.length - 1 } satisfies ResponsesOutputSlot;
+			const slot = {
+				type: "text",
+				block,
+				contentIndex: output.content.length - 1,
+				outputIndex,
+			} satisfies ResponsesOutputSlot;
 			outputSlots.set(outputIndex, slot);
 			stream.push({ type: "text_start", contentIndex: slot.contentIndex, partial: output });
+			if (item.id !== undefined) slotsByItemId.set(item.id, slot);
 			return slot;
 		}
 		if (item.type === "function_call") {
@@ -515,9 +535,11 @@ export async function processResponsesStream<TApi extends Api>(
 				type: "toolCall",
 				block,
 				contentIndex: output.content.length - 1,
+				outputIndex,
 			} satisfies ResponsesOutputSlot;
 			outputSlots.set(outputIndex, slot);
 			stream.push({ type: "toolcall_start", contentIndex: slot.contentIndex, partial: output });
+			if (item.id !== undefined) slotsByItemId.set(item.id, slot);
 			return slot;
 		}
 		if (item.type === "custom_tool_call") {
@@ -539,9 +561,11 @@ export async function processResponsesStream<TApi extends Api>(
 				type: "toolCall",
 				block,
 				contentIndex: output.content.length - 1,
+				outputIndex,
 			} satisfies ResponsesOutputSlot;
 			outputSlots.set(outputIndex, slot);
 			stream.push({ type: "toolcall_start", contentIndex: slot.contentIndex, partial: output });
+			if (item.id !== undefined) slotsByItemId.set(item.id, slot);
 			return slot;
 		}
 		return undefined;
@@ -624,7 +648,7 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.output_item.added") {
 			createSlot(event.output_index, event.item);
 		} else if (event.type === "response.reasoning_summary_text.delta") {
-			const slot = getSlot(event.output_index, "thinking");
+			const slot = getSlotForEvent(event, "thinking");
 			if (!slot) continue;
 			slot.block.thinking += event.delta;
 			stream.push({
@@ -634,7 +658,7 @@ export async function processResponsesStream<TApi extends Api>(
 				partial: output,
 			});
 		} else if (event.type === "response.reasoning_summary_part.done") {
-			const slot = getSlot(event.output_index, "thinking");
+			const slot = getSlotForEvent(event, "thinking");
 			if (!slot) continue;
 			slot.block.thinking += "\n\n";
 			stream.push({
@@ -644,7 +668,7 @@ export async function processResponsesStream<TApi extends Api>(
 				partial: output,
 			});
 		} else if (event.type === "response.reasoning_text.delta") {
-			const slot = getSlot(event.output_index, "thinking");
+			const slot = getSlotForEvent(event, "thinking");
 			if (!slot) continue;
 			slot.block.thinking += event.delta;
 			stream.push({
@@ -653,8 +677,21 @@ export async function processResponsesStream<TApi extends Api>(
 				delta: event.delta,
 				partial: output,
 			});
+		} else if ((event as { type?: string }).type === "response.reasoning.delta") {
+			// Non-standard event type emitted by Venice.ai: same semantics as
+			// response.reasoning_text.delta but with item_id only (no output_index).
+			const { delta } = event as unknown as { delta: string };
+			const slot = getSlotForEvent(event as { output_index?: number; item_id?: string }, "thinking");
+			if (!slot || delta === undefined) continue;
+			slot.block.thinking += delta;
+			stream.push({
+				type: "thinking_delta",
+				contentIndex: slot.contentIndex,
+				delta,
+				partial: output,
+			});
 		} else if (event.type === "response.output_text.delta") {
-			const slot = getSlot(event.output_index, "text");
+			const slot = getSlotForEvent(event, "text");
 			if (!slot) continue;
 			slot.block.text += event.delta;
 			stream.push({
@@ -664,7 +701,7 @@ export async function processResponsesStream<TApi extends Api>(
 				partial: output,
 			});
 		} else if (event.type === "response.refusal.delta") {
-			const slot = getSlot(event.output_index, "text");
+			const slot = getSlotForEvent(event, "text");
 			if (!slot) continue;
 			slot.block.text += event.delta;
 			stream.push({
@@ -674,13 +711,13 @@ export async function processResponsesStream<TApi extends Api>(
 				partial: output,
 			});
 		} else if (event.type === "response.function_call_arguments.delta") {
-			const slot = getSlot(event.output_index, "toolCall");
+			const slot = getSlotForEvent(event, "toolCall");
 			if (!slot || slot.block.partialJson === undefined) continue;
 			slot.block.partialJson += event.delta;
 			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
 			pushToolCallDelta(slot, event.delta);
 		} else if (event.type === "response.function_call_arguments.done") {
-			const slot = getSlot(event.output_index, "toolCall");
+			const slot = getSlotForEvent(event, "toolCall");
 			if (!slot || slot.block.partialJson === undefined) continue;
 			const previousPartialJson = slot.block.partialJson;
 			slot.block.partialJson = event.arguments;
@@ -691,23 +728,34 @@ export async function processResponsesStream<TApi extends Api>(
 				if (delta.length > 0) pushToolCallDelta(slot, delta);
 			}
 		} else if (event.type === "response.custom_tool_call_input.delta") {
-			const slot = getSlot(event.output_index, "toolCall");
+			const slot = getSlotForEvent(event, "toolCall");
 			if (!slot || !slot.block.customInput) continue;
 			pushToolCallDelta(
 				slot,
 				appendCustomToolCallInput(slot.block, getCustomToolCallInput(slot.block) + event.delta, false),
 			);
 		} else if (event.type === "response.custom_tool_call_input.done") {
-			const slot = getSlot(event.output_index, "toolCall");
+			const slot = getSlotForEvent(event, "toolCall");
 			if (!slot || !slot.block.customInput) continue;
 			pushToolCallDelta(slot, appendCustomToolCallInput(slot.block, event.input, true));
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
 			applyMessagePhaseStopReason(item);
-			const slot = getOrCreateSlot(event.output_index, item);
+			// Resolve an existing slot by item id first: non-compliant servers may
+			// omit output_index here, and creating a fresh slot would duplicate the
+			// block and leave the original one unfinished.
+			const existingSlot = item.id !== undefined ? slotsByItemId.get(item.id) : undefined;
+			const slot = existingSlot ?? getOrCreateSlot(event.output_index, item);
 
 			if (item.type === "reasoning" && slot?.type === "thinking") {
-				const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
+				// Venice sends summary elements as plain strings instead of
+				// {type:"summary_text", text} objects.
+				const summaries = item.summary as unknown as Array<string | { text?: string }> | undefined;
+				const summaryText =
+					summaries
+						?.map((s) => (typeof s === "string" ? s : s.text))
+						.filter((t): t is string => typeof t === "string")
+						.join("\n\n") || "";
 				const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
 				slot.block.thinking = summaryText || contentText || slot.block.thinking;
 				slot.block.thinkingSignature = JSON.stringify(item);
@@ -718,7 +766,8 @@ export async function processResponsesStream<TApi extends Api>(
 					content: slot.block.thinking,
 					partial: output,
 				});
-				outputSlots.delete(event.output_index);
+				outputSlots.delete(slot.outputIndex);
+				if (item.id !== undefined) slotsByItemId.delete(item.id);
 			} else if (item.type === "message" && slot?.type === "text") {
 				slot.block.text = item.content?.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("") || "";
 				slot.block.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
@@ -728,7 +777,8 @@ export async function processResponsesStream<TApi extends Api>(
 					content: slot.block.text,
 					partial: output,
 				});
-				outputSlots.delete(event.output_index);
+				outputSlots.delete(slot.outputIndex);
+				if (item.id !== undefined) slotsByItemId.delete(item.id);
 			} else if (
 				item.type === "function_call" &&
 				slot?.type === "toolCall" &&
@@ -745,7 +795,8 @@ export async function processResponsesStream<TApi extends Api>(
 					toolCall: slot.block,
 					partial: output,
 				});
-				outputSlots.delete(event.output_index);
+				outputSlots.delete(slot.outputIndex);
+				if (item.id !== undefined) slotsByItemId.delete(item.id);
 			} else if (item.type === "custom_tool_call" && slot?.type === "toolCall" && slot.block.customInput) {
 				pushToolCallDelta(
 					slot,
@@ -759,7 +810,8 @@ export async function processResponsesStream<TApi extends Api>(
 					toolCall: slot.block,
 					partial: output,
 				});
-				outputSlots.delete(event.output_index);
+				outputSlots.delete(slot.outputIndex);
+				if (item.id !== undefined) slotsByItemId.delete(item.id);
 			}
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(getEventResponse(event));
