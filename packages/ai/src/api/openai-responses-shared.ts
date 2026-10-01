@@ -48,6 +48,24 @@ import { transformMessages } from "./transform-messages.ts";
 
 // =============================================================================
 // Utilities
+
+// Some OpenAI-compatible providers (e.g. Venice.ai's /responses endpoint) send
+// lifecycle events with the response object at the top level instead of nested
+// under "response". Tolerate both shapes so nonconformant providers don't crash
+// the stream parser.
+type ResponsesLifecycleEvent = Extract<
+	ResponseStreamEvent,
+	{ type: "response.created" | "response.completed" | "response.incomplete" | "response.failed" }
+>;
+type ResponsesResponse = Extract<ResponseStreamEvent, { type: "response.created" }>;
+
+const getEventResponse = (event: ResponsesLifecycleEvent): ResponsesResponse["response"] | undefined => {
+	const nested = (event as { response?: ResponsesResponse["response"] }).response;
+	if (nested !== undefined) return nested;
+	// Flat shape: the response object itself is the event.
+	return event as unknown as ResponsesResponse["response"];
+};
+
 // =============================================================================
 
 function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
@@ -550,10 +568,12 @@ export async function processResponsesStream<TApi extends Api>(
 		}
 	};
 	const finalizeResponse = (
-		response: Extract<ResponseStreamEvent, { type: "response.completed" | "response.incomplete" }>["response"],
+		response:
+			| Extract<ResponseStreamEvent, { type: "response.completed" | "response.incomplete" }>["response"]
+			| undefined,
 	): void => {
 		sawTerminalResponseEvent = true;
-		backfillReasoningSignatures(response.output ?? []);
+		backfillReasoningSignatures(response?.output ?? []);
 		if (response?.id) {
 			output.responseId = response.id;
 		}
@@ -599,7 +619,8 @@ export async function processResponsesStream<TApi extends Api>(
 	for await (const event of openaiStream) {
 		await options?.onProviderStreamEvent?.(event, model);
 		if (event.type === "response.created") {
-			output.responseId = event.response.id;
+			const response = getEventResponse(event);
+			if (response?.id) output.responseId = response.id;
 		} else if (event.type === "response.output_item.added") {
 			createSlot(event.output_index, event.item);
 		} else if (event.type === "response.reasoning_summary_text.delta") {
@@ -741,14 +762,15 @@ export async function processResponsesStream<TApi extends Api>(
 				outputSlots.delete(event.output_index);
 			}
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
-			finalizeResponse(event.response);
+			finalizeResponse(getEventResponse(event));
 		} else if (event.type === "error") {
 			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
-			output.rawStopReason = event.response?.status;
-			const error = event.response?.error;
-			const details = event.response?.incomplete_details;
+			const response = getEventResponse(event);
+			output.rawStopReason = response?.status;
+			const error = response?.error;
+			const details = response?.incomplete_details;
 			const msg = error
 				? `${error.code || "unknown"}: ${error.message || "no message"}`
 				: details?.reason
