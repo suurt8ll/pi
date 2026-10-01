@@ -226,6 +226,7 @@ async function* createUnfinishedToolCallEvents(): AsyncIterable<ResponseStreamEv
 }
 
 // llama.cpp omits output_index from every event and sends both done events after all deltas.
+// Slots are resolved by item id, so both calls finalize correctly from their done events.
 async function* createToolCallsWithoutOutputIndexEvents(): AsyncIterable<ResponseStreamEvent> {
 	const call = (n: string) => ({ type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name: "bash" });
 	const events = [
@@ -265,17 +266,18 @@ describe("OpenAI Responses terminal event handling", () => {
 	});
 
 	// https://github.com/earendil-works/pi/issues/9974
-	it("rejects parallel tool calls without output_index instead of running mixed-up calls", async () => {
+	it("finalizes parallel tool calls without output_index with correct arguments instead of mixing them up", async () => {
 		const model = createModel();
+		const output = createOutput(model);
+		const stream = new AssistantMessageEventStream();
 
-		await expect(
-			processResponsesStream(
-				createToolCallsWithoutOutputIndexEvents(),
-				createOutput(model),
-				new AssistantMessageEventStream(),
-				model,
-			),
-		).rejects.toThrow("OpenAI Responses stream completed with an unfinished tool call: bash (call_a|fc_a)");
+		await processResponsesStream(createToolCallsWithoutOutputIndexEvents(), output, stream, model);
+
+		expect(output.stopReason).toBe("toolUse");
+		const toolCalls = output.content.filter((b) => b.type === "toolCall");
+		expect(toolCalls).toHaveLength(2);
+		expect(toolCalls[0]).toMatchObject({ id: "call_a|fc_a", arguments: { command: "echo a" } });
+		expect(toolCalls[1]).toMatchObject({ id: "call_b|fc_b", arguments: { command: "echo b" } });
 	});
 
 	it("forwards parsed provider stream events in order", async () => {
