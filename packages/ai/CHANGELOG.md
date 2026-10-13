@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fixed doubled/garbled reasoning in /responses streaming when a bridge (e.g. LiteLLM translating chat `reasoning_content`) emits the same thinking as both `response.reasoning_summary_text.delta` and `response.reasoning_text.delta`: the first delta flavor a reasoning slot streams now wins and the other flavor is ignored, so the final `output_item.done` no longer appears to "reset" duplicated thinking back to clean text
+
 ## [1.4.0] - 2026-10-21
 
 ### Breaking Changes
