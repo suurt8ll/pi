@@ -442,7 +442,14 @@ function appendCustomToolCallInput(block: StreamingToolCall, nextInput: string, 
 }
 
 type ResponsesOutputSlot =
-	| { type: "thinking"; block: ThinkingContent; contentIndex: number; outputIndex: number }
+	| {
+			type: "thinking";
+			block: ThinkingContent;
+			contentIndex: number;
+			outputIndex: number;
+			/** Which reasoning delta flavor the slot has streamed; the other flavor is then ignored. */
+			streamedDeltaKind?: "summary" | "text";
+	  }
 	| { type: "text"; block: TextContent; contentIndex: number; outputIndex: number }
 	| { type: "toolCall"; block: StreamingToolCall; contentIndex: number; outputIndex: number };
 
@@ -650,6 +657,12 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.reasoning_summary_text.delta") {
 			const slot = getSlotForEvent(event, "thinking");
 			if (!slot) continue;
+			// Some bridges (e.g. LiteLLM translating chat reasoning_content to
+			// /responses) emit summary and reasoning_text deltas with identical
+			// content. The first delta flavor a slot streams wins; the other is
+			// ignored so thinking is not appended twice.
+			if (slot.streamedDeltaKind === "text") continue;
+			slot.streamedDeltaKind = "summary";
 			slot.block.thinking += event.delta;
 			stream.push({
 				type: "thinking_delta",
@@ -660,6 +673,7 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.reasoning_summary_part.done") {
 			const slot = getSlotForEvent(event, "thinking");
 			if (!slot) continue;
+			if (slot.streamedDeltaKind === "text") continue;
 			slot.block.thinking += "\n\n";
 			stream.push({
 				type: "thinking_delta",
@@ -670,6 +684,10 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.reasoning_text.delta") {
 			const slot = getSlotForEvent(event, "thinking");
 			if (!slot) continue;
+			// See the summary delta case: ignore raw text deltas once summary
+			// deltas have streamed for this slot.
+			if (slot.streamedDeltaKind === "summary") continue;
+			slot.streamedDeltaKind = "text";
 			slot.block.thinking += event.delta;
 			stream.push({
 				type: "thinking_delta",
@@ -683,6 +701,8 @@ export async function processResponsesStream<TApi extends Api>(
 			const { delta } = event as unknown as { delta: string };
 			const slot = getSlotForEvent(event as { output_index?: number; item_id?: string }, "thinking");
 			if (!slot || delta === undefined) continue;
+			if (slot.streamedDeltaKind === "summary") continue;
+			slot.streamedDeltaKind = "text";
 			slot.block.thinking += delta;
 			stream.push({
 				type: "thinking_delta",
