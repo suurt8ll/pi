@@ -5,6 +5,8 @@
 ### Fixed
 
 - Fixed doubled/garbled reasoning in /responses streaming when a bridge (e.g. LiteLLM translating chat `reasoning_content`) emits the same thinking as both `response.reasoning_summary_text.delta` and `response.reasoning_text.delta`: the first delta flavor a reasoning slot streams now wins and the other flavor is ignored, so the final `output_item.done` no longer appears to "reset" duplicated thinking back to clean text
+- Fixed OpenCode Go Gemini models failing with a 404 by moving OpenCode Zen and OpenCode Go to the `opencode.ai/inference` endpoints, and added Google Generative AI support to the OpenCode Go provider
+- Fixed OpenCode Go MiniMax M2.7 failing with "Model does not support this protocol" by using the Anthropic Messages API
 
 ## [1.2.0] - 2026-10-12
 
