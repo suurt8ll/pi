@@ -404,8 +404,6 @@ export function createCodemodeTool(
 	const tool = wrapToolDefinition(definition);
 	Object.assign(tool, {
 		description: createCodemodeDescription(tools, { models: options.models === true }),
-		promptSnippet: definition.promptSnippet,
-		promptGuidelines: definition.promptGuidelines,
 	});
 	return tool;
 }

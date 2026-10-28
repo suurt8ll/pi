@@ -467,6 +467,15 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	/** Human-readable label for UI display. */
 	label: string;
 	/**
+	 * One-line snippet for the default system prompt's tool list. Prompt-facing metadata like
+	 * `label` travels with the tool: wrapping a ToolDefinition must not drop it, or a tool
+	 * registered from a wrapper (a re-registered built-in) would lose its place in the prompt
+	 * while its declaration still reaches the model.
+	 */
+	promptSnippet?: string;
+	/** Guideline bullets for the default system prompt's rules section. */
+	promptGuidelines?: string[];
+	/**
 	 * Optional compatibility shim for raw tool-call arguments before schema validation.
 	 * Must return an object that matches `TParameters`.
 	 */

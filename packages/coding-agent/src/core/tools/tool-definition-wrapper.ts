@@ -18,6 +18,11 @@ export function wrapToolDefinition<TDetails = unknown>(
 		constrainedSampling: definition.constrainedSampling,
 		prepareArguments: definition.prepareArguments,
 		executionMode: definition.executionMode,
+		// Prompt metadata stays with the tool: the wrapper's output can end up back in
+		// registerTool() (a built-in re-registered by an extension), and the system prompt is
+		// built from the registered definition, not from the original one.
+		promptSnippet: definition.promptSnippet,
+		promptGuidelines: definition.promptGuidelines,
 		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionToolContext) =>
 			definition.execute(
 				toolCallId,
