@@ -1,15 +1,20 @@
 import { describe, expect, test } from "vitest";
-import { bashToolSystemPromptContribution, createBashToolDefinition } from "../src/core/tools/bash.ts";
-import { createEditToolDefinition, editToolSystemPromptContribution } from "../src/core/tools/edit.ts";
-import { createFindToolDefinition, findToolSystemPromptContribution } from "../src/core/tools/find.ts";
-import { createGrepToolDefinition, grepToolSystemPromptContribution } from "../src/core/tools/grep.ts";
-import { createLsToolDefinition, lsToolSystemPromptContribution } from "../src/core/tools/ls.ts";
+import { bashToolSystemPromptContribution, createBashTool, createBashToolDefinition } from "../src/core/tools/bash.ts";
+import { createEditTool, createEditToolDefinition, editToolSystemPromptContribution } from "../src/core/tools/edit.ts";
+import { createFindTool, createFindToolDefinition, findToolSystemPromptContribution } from "../src/core/tools/find.ts";
+import { createGrepTool, createGrepToolDefinition, grepToolSystemPromptContribution } from "../src/core/tools/grep.ts";
+import { createLsTool, createLsToolDefinition, lsToolSystemPromptContribution } from "../src/core/tools/ls.ts";
 import {
+	createPowerShellTool,
 	createPowerShellToolDefinition,
 	powershellToolSystemPromptContribution,
 } from "../src/core/tools/powershell.ts";
-import { createReadToolDefinition, readToolSystemPromptContribution } from "../src/core/tools/read.ts";
-import { createWriteToolDefinition, writeToolSystemPromptContribution } from "../src/core/tools/write.ts";
+import { createReadTool, createReadToolDefinition, readToolSystemPromptContribution } from "../src/core/tools/read.ts";
+import {
+	createWriteTool,
+	createWriteToolDefinition,
+	writeToolSystemPromptContribution,
+} from "../src/core/tools/write.ts";
 
 const cases = [
 	["read", readToolSystemPromptContribution, createReadToolDefinition],
@@ -20,6 +25,17 @@ const cases = [
 	["grep", grepToolSystemPromptContribution, createGrepToolDefinition],
 	["find", findToolSystemPromptContribution, createFindToolDefinition],
 	["ls", lsToolSystemPromptContribution, createLsToolDefinition],
+] as const;
+
+const wrappedCases = [
+	["read", readToolSystemPromptContribution, createReadTool],
+	["bash", bashToolSystemPromptContribution, createBashTool],
+	["powershell", powershellToolSystemPromptContribution, createPowerShellTool],
+	["edit", editToolSystemPromptContribution, createEditTool],
+	["write", writeToolSystemPromptContribution, createWriteTool],
+	["grep", grepToolSystemPromptContribution, createGrepTool],
+	["find", findToolSystemPromptContribution, createFindTool],
+	["ls", lsToolSystemPromptContribution, createLsTool],
 ] as const;
 
 describe("built-in tool system prompt contributions", () => {
@@ -41,4 +57,17 @@ describe("built-in tool system prompt contributions", () => {
 
 		expect(definition.promptGuidelines).toBeUndefined();
 	});
+
+	// The wrapper is what an extension hands to registerTool() when it re-registers a built-in,
+	// and the prompt is built from the registered definition: dropping the contributions here
+	// would silently remove the tool from the prompt's <tools> list and <rules> section.
+	test.each(wrappedCases)(
+		"keeps the wrapped %s tool aligned with its contribution",
+		(_name, contribution, createTool) => {
+			const tool = createTool("/workspace");
+
+			expect(tool.promptSnippet).toBe(contribution.snippet);
+			expect(tool.promptGuidelines ?? []).toEqual(contribution.guidelines);
+		},
+	);
 });
