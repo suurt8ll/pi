@@ -1172,4 +1172,30 @@ describe("tmux image passthrough", () => {
 		);
 		resetCapabilitiesCache();
 	});
+
+	it("honours the passthrough override with no tmux trace in the environment", () => {
+		// A sandbox: docker drops TMUX, rewrites TERM to xterm, and the image carries no tmux
+		// binary, so neither the env gate nor the probe can fire — the launcher's override is all
+		// there is. This is how pi-fluid turns images on inside a container.
+		withEnv({ TERM: "xterm", PI_IMAGE_PROTOCOL: "kitty", PI_TMUX_IMAGES: "1" }, () => {
+			resetCapabilitiesCache();
+			assert.strictEqual(isTmuxImagePassthroughEnabled(), true);
+		});
+		withEnv({ TERM: "xterm", PI_IMAGE_PROTOCOL: "kitty", PI_TMUX_IMAGES: "0" }, () => {
+			resetCapabilitiesCache();
+			assert.strictEqual(isTmuxImagePassthroughEnabled(), false);
+		});
+		// Without the override the environment still has to look like tmux: a container that
+		// merely renders images must not start wrapping sequences nobody will unwrap.
+		withEnv({ TERM: "xterm", PI_IMAGE_PROTOCOL: "kitty" }, () => {
+			resetCapabilitiesCache();
+			assert.strictEqual(isTmuxImagePassthroughEnabled(), false);
+		});
+		// The override says "tmux will forward", not "emit images where none are rendered".
+		withEnv({ TERM: "xterm", PI_IMAGE_PROTOCOL: "none", PI_TMUX_IMAGES: "1" }, () => {
+			resetCapabilitiesCache();
+			assert.strictEqual(isTmuxImagePassthroughEnabled(), false);
+		});
+		resetCapabilitiesCache();
+	});
 });
