@@ -13,6 +13,7 @@ import {
 	deleteAllKittyPlacements,
 	deleteKittyImage,
 	detectCapabilities,
+	detectTmuxImagePassthrough,
 	encodeITerm2,
 	encodeKitty,
 	getCapabilities,
@@ -22,12 +23,15 @@ import {
 	hyperlink,
 	imageFallback,
 	isImageLine,
+	isTmuxImagePassthroughEnabled,
 	registerKittyImageMetadata,
 	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
 	setCapabilityOverrides,
 	setCellDimensions,
+	wrapImageSequencesForTmux,
+	wrapTmuxPassthrough,
 } from "../src/terminal-image.ts";
 import { visibleWidth } from "../src/utils.ts";
 
@@ -50,6 +54,7 @@ const ENV_KEYS = [
 	"PI_HYPERLINKS",
 	"PI_IMAGE_PROTOCOL",
 	"PI_TRUE_COLOR",
+	"PI_TMUX_IMAGES",
 ] as const;
 
 function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
@@ -286,7 +291,10 @@ describe("detectCapabilities", () => {
 
 	it("enables hyperlinks under tmux when the client forwards them", () => {
 		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM_PROGRAM: "ghostty" }, () => {
-			const caps = detectCapabilities(() => true);
+			const caps = detectCapabilities(
+				() => true,
+				() => false,
+			);
 			assert.strictEqual(caps.hyperlinks, true);
 			assert.strictEqual(caps.images, null);
 		});
@@ -294,20 +302,51 @@ describe("detectCapabilities", () => {
 
 	it("disables hyperlinks under tmux when the client does not forward them", () => {
 		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM_PROGRAM: "ghostty" }, () => {
-			const caps = detectCapabilities(() => false);
+			const caps = detectCapabilities(
+				() => false,
+				() => false,
+			);
 			assert.strictEqual(caps.hyperlinks, false);
+			assert.strictEqual(caps.images, null);
+		});
+	});
+
+	it("enables Kitty images under tmux when tmux forwards the passthrough", () => {
+		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color" }, () => {
+			const caps = detectCapabilities(
+				() => false,
+				() => true,
+			);
+			assert.strictEqual(caps.images, "kitty");
+			assert.strictEqual(caps.hyperlinks, false);
+		});
+	});
+
+	it("keeps images off under tmux when tmux will not forward the passthrough", () => {
+		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color" }, () => {
+			const caps = detectCapabilities(
+				() => false,
+				() => false,
+			);
 			assert.strictEqual(caps.images, null);
 		});
 	});
 
 	it("checks tmux capability when TERM starts with 'tmux'", () => {
 		withEnv({ TERM: "tmux-256color", TERM_PROGRAM: "iterm.app" }, () => {
-			const caps = detectCapabilities(() => true);
+			const caps = detectCapabilities(
+				() => true,
+				() => true,
+			);
 			assert.strictEqual(caps.hyperlinks, true);
-			assert.strictEqual(caps.images, null);
+			assert.strictEqual(caps.images, "kitty");
 
-			const caps2 = detectCapabilities(() => false);
+			const caps2 = detectCapabilities(
+				() => false,
+				() => false,
+			);
 			assert.strictEqual(caps2.hyperlinks, false);
+			assert.strictEqual(caps2.images, null);
 		});
 	});
 
@@ -425,7 +464,12 @@ describe("detectCapabilities", () => {
 				TERM: "tmux-256color",
 			},
 			() => {
-				const caps = detectCapabilities(() => true);
+				// Warp's client termname is not recognised as a Kitty graphics terminal, so the
+				// passthrough probe stays off even with `allow-passthrough` enabled.
+				const caps = detectCapabilities(
+					() => true,
+					() => false,
+				);
 				assert.strictEqual(caps.images, null);
 				assert.strictEqual(caps.hyperlinks, true);
 			},
@@ -481,7 +525,10 @@ describe("detectCapabilities", () => {
 
 	it("does not inherit Windows Terminal truecolor through tmux", () => {
 		withEnv({ WT_SESSION: "session", TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color" }, () => {
-			const caps = detectCapabilities(() => false);
+			const caps = detectCapabilities(
+				() => false,
+				() => false,
+			);
 			assert.strictEqual(caps.trueColor, false);
 			assert.strictEqual(caps.hyperlinks, false);
 			assert.strictEqual(caps.images, null);
@@ -490,7 +537,10 @@ describe("detectCapabilities", () => {
 
 	it("trusts explicit truecolor hints through tmux", () => {
 		withEnv({ COLORTERM: "truecolor", TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color" }, () => {
-			const caps = detectCapabilities(() => false);
+			const caps = detectCapabilities(
+				() => false,
+				() => false,
+			);
 			assert.strictEqual(caps.trueColor, true);
 			assert.strictEqual(caps.hyperlinks, false);
 			assert.strictEqual(caps.images, null);
@@ -965,5 +1015,161 @@ describe("hyperlink", () => {
 		const result = hyperlink("README.md", "file:///home/user/README.md");
 		assert.ok(result.includes("file:///home/user/README.md"));
 		assert.ok(result.includes("README.md"));
+	});
+});
+
+describe("tmux image passthrough", () => {
+	it("wraps a sequence in a DCS passthrough with doubled ESCs", () => {
+		const wrapped = wrapTmuxPassthrough("\x1b_Ga=T;AAAA\x1b\\");
+		assert.strictEqual(wrapped, "\x1bPtmux;\x1b\x1b_Ga=T;AAAA\x1b\x1b\\\x1b\\");
+	});
+
+	it("wraps every image sequence in a write and leaves text alone", () => {
+		const first = "\x1b_Ga=T,f=100;AAAA\x1b\\";
+		const second = "\x1b_Ga=p,i=7\x1b\\";
+		const data = `before${first}\r\nmiddle${second}\x1b[1;1Hafter`;
+		const { output, pending } = wrapImageSequencesForTmux(data);
+		assert.strictEqual(pending, "");
+		assert.strictEqual(
+			output,
+			`before${wrapTmuxPassthrough(first)}\r\nmiddle${wrapTmuxPassthrough(second)}\x1b[1;1Hafter`,
+		);
+		// Every wrapped body is un-doubled back to the original bytes by tmux.
+		assert.strictEqual(output.replaceAll("\x1b\x1b", "\x1b").includes(first), true);
+	});
+
+	it("wraps each chunk of a chunked transmission separately", () => {
+		const chunks = ["\x1b_Ga=T,f=100,m=1;AAAA\x1b\\", "\x1b_Gm=1;BBBB\x1b\\", "\x1b_Gm=0;CCCC\x1b\\"];
+		const { output } = wrapImageSequencesForTmux(chunks.join(""));
+		assert.strictEqual(output, chunks.map(wrapTmuxPassthrough).join(""));
+	});
+
+	it("repeats the anchor before every chunk of a chunked transmission", () => {
+		// tmux forwards each chunk as it parses it, interleaved with its own repaints, so the outer
+		// cursor has moved by the time the closing chunk makes the terminal display the image. Every
+		// chunk therefore carries the anchor of the opening one, and the state ends with the payload.
+		const chunks = ["\x1b_Ga=T,f=100,m=1;AAAA\x1b\\", "\x1b_Gm=1;BBBB\x1b\\", "\x1b_Gm=0;CCCC\x1b\\"];
+		const anchor = "\x1b[11;1H";
+		const trailing = "\x1b_Ga=p,q=2,i=7\x1b\\";
+		const { output } = wrapImageSequencesForTmux(`${anchor}${chunks.join("")}\x1b[20;1H${trailing}`);
+
+		assert.strictEqual(
+			output,
+			// The placement after `m=0` starts a new transmission state and takes its own fresh anchor.
+			`${anchor}${chunks.map((chunk) => wrapTmuxPassthrough(`${anchor}${chunk}`)).join("")}\x1b[20;1H${wrapTmuxPassthrough(`\x1b[20;1H${trailing}`)}`,
+		);
+	});
+
+	it("wraps iTerm2 inline images", () => {
+		const data = "\x1b]1337;File=inline=1;size=3:AAAA\x07";
+		assert.strictEqual(wrapImageSequencesForTmux(data).output, wrapTmuxPassthrough(data));
+	});
+
+	it("holds back an unterminated sequence for the next write", () => {
+		const data = "text\x1b_Ga=T,f=100;AAA";
+		const first = wrapImageSequencesForTmux(data);
+		assert.strictEqual(first.output, "text");
+		assert.strictEqual(first.pending, "\x1b_Ga=T,f=100;AAA");
+
+		const second = wrapImageSequencesForTmux(`${first.pending}BBB\x1b\\tail`);
+		assert.strictEqual(second.pending, "");
+		assert.strictEqual(second.output, `${wrapTmuxPassthrough("\x1b_Ga=T,f=100;AAABBB\x1b\\")}tail`);
+	});
+
+	it("emits an oversized unterminated sequence unwrapped instead of holding it forever", () => {
+		const data = `\x1b_Ga=T;${"A".repeat(64)}`;
+		const { output, pending } = wrapImageSequencesForTmux(data, 32);
+		assert.strictEqual(pending, "");
+		assert.strictEqual(output, data);
+	});
+
+	it("does not double-wrap data that already carries a passthrough", () => {
+		const data = wrapTmuxPassthrough("\x1b_Ga=T;AAAA\x1b\\");
+		assert.strictEqual(wrapImageSequencesForTmux(data).output, data);
+	});
+
+	it("keeps a pre-wrapped passthrough while wrapping the images around it", () => {
+		// The main-screen renderer builds its own passthrough when it re-places scrolled images, and
+		// the same write also carries the plain image sequences of the lines it just rendered.
+		const preWrapped = wrapTmuxPassthrough("\x1b[5;1H\x1b_Ga=p,q=2,i=7\x1b\\");
+		const data = `\x1b[3;1H\x1b_Ga=T,i=1;AAAA\x1b\\${preWrapped}tail`;
+		const { output, pending } = wrapImageSequencesForTmux(data);
+
+		assert.strictEqual(pending, "");
+		assert.ok(output.includes(preWrapped), "the caller's passthrough must survive verbatim");
+		// The anchor stays outside as well: tmux's own cursor model must still follow the frame.
+		assert.strictEqual(
+			output,
+			`\x1b[3;1H${wrapTmuxPassthrough("\x1b[3;1H\x1b_Ga=T,i=1;AAAA\x1b\\")}${preWrapped}tail`,
+		);
+	});
+
+	it("keeps a multi-sequence passthrough intact instead of wrapping it again", () => {
+		// The re-place pass emits one passthrough with several sequences in it, so the body holds
+		// doubled terminators before the real one; scanning for the first `ESC \\` would cut it apart
+		// and re-wrap the tail, leaving a nested passthrough that no terminal understands.
+		const body = "\x1b_Ga=d,d=a,q=2\x1b\\\x1b[1;1H\x1b_Ga=p,q=2,c=8,i=7\x1b\\\x1b[12;1H";
+		const preWrapped = wrapTmuxPassthrough(body);
+		const { output, pending } = wrapImageSequencesForTmux(preWrapped);
+
+		assert.strictEqual(pending, "");
+		assert.strictEqual(output, preWrapped);
+		assert.strictEqual(output.split("\x1bPtmux;").length, 2, "exactly one passthrough must remain");
+	});
+
+	it("holds back an unterminated passthrough for the next write", () => {
+		const partial = "\x1bPtmux;\x1b\x1b_Ga=d,d=a,q=2";
+		const { output, pending } = wrapImageSequencesForTmux(`text${partial}`);
+		assert.strictEqual(output, "text");
+		assert.strictEqual(pending, partial);
+	});
+
+	it("detects whether tmux will forward images", () => {
+		// No tmux server in the test environment: the probe fails and images stay off.
+		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color" }, () => {
+			assert.strictEqual(detectTmuxImagePassthrough(), false);
+		});
+		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color", PI_TMUX_IMAGES: "1" }, () => {
+			assert.strictEqual(detectTmuxImagePassthrough(), true);
+		});
+		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color", PI_TMUX_IMAGES: "0" }, () => {
+			assert.strictEqual(detectTmuxImagePassthrough(), false);
+		});
+	});
+
+	it("only enables passthrough for terminals that can render the images", () => {
+		withEnv({ TMUX: "/tmp/tmux-1000/default,1234,0", TERM: "tmux-256color", PI_IMAGE_PROTOCOL: "kitty" }, () => {
+			resetCapabilitiesCache();
+			assert.strictEqual(isTmuxImagePassthroughEnabled(), false);
+		});
+		withEnv({ TERM_PROGRAM: "ghostty", PI_IMAGE_PROTOCOL: "kitty" }, () => {
+			resetCapabilitiesCache();
+			assert.strictEqual(isTmuxImagePassthroughEnabled(), false);
+		});
+		withEnv(
+			{
+				TMUX: "/tmp/tmux-1000/default,1234,0",
+				TERM: "tmux-256color",
+				PI_IMAGE_PROTOCOL: "kitty",
+				PI_TMUX_IMAGES: "1",
+			},
+			() => {
+				resetCapabilitiesCache();
+				assert.strictEqual(isTmuxImagePassthroughEnabled(), true);
+			},
+		);
+		withEnv(
+			{
+				TMUX: "/tmp/tmux-1000/default,1234,0",
+				TERM: "tmux-256color",
+				PI_IMAGE_PROTOCOL: "none",
+				PI_TMUX_IMAGES: "1",
+			},
+			() => {
+				resetCapabilitiesCache();
+				assert.strictEqual(isTmuxImagePassthroughEnabled(), false);
+			},
+		);
+		resetCapabilitiesCache();
 	});
 });
