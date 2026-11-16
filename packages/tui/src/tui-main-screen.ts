@@ -4,6 +4,7 @@ import * as path from "node:path";
 import {
 	deleteAllKittyPlacements,
 	deleteKittyImage,
+	getCapabilities,
 	getKittyImageMetadata,
 	getKittyImagePlacement,
 	getMaxKittyImageRows,
@@ -178,6 +179,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
+		this.deletePlacedKittyImages();
 		if (options.preserveScreen || this.previousLines.length === 0) return;
 		this.terminal.write(" ");
 		const targetRow = this.previousLines.length;
@@ -185,6 +187,20 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (lineDiff > 0) this.terminal.write(`\x1b[${lineDiff}B`);
 		else if (lineDiff < 0) this.terminal.write(`\x1b[${-lineDiff}A`);
 		this.terminal.write("\r\n");
+	}
+
+	/**
+	 * A Kitty placement outlives the process that drew it: the terminal keeps painting it at the screen row it was
+	 * anchored to, so once the shell prompt scrolls the transcript that row ends up above the pane and the placement
+	 * stays behind as a fragment clipped at the pane's top-left corner. tmux cannot clean it up either, because under a
+	 * passthrough the image lives in the outer terminal. Delete by id (`d=I`) rather than with a terminal-wide delete
+	 * (`d=A`): the passthrough reaches the outer terminal, where a blanket delete would also take other panes' images.
+	 */
+	private deletePlacedKittyImages(): void {
+		if (getCapabilities().images !== "kitty" || this.previousKittyImageIds.size === 0) return;
+		// Own write() call: the deletes need no cursor anchor, and findTrailingImageAnchor only inspects the current write.
+		this.terminal.write(this.deleteKittyImages(this.previousKittyImageIds));
+		this.previousKittyImageIds = new Set();
 	}
 
 	private collectKittyImageIds(lines: string[]): Set<number> {
