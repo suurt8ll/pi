@@ -10,6 +10,7 @@ import {
 	type ProgramStatus,
 } from "./program-status.ts";
 import { StdinBuffer } from "./stdin-buffer.ts";
+import { isTmuxImagePassthroughEnabled, wrapImageSequencesForTmux } from "./terminal-image.ts";
 import { replaceControlCharacters } from "./utils.ts";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
@@ -181,6 +182,8 @@ export class ProcessTerminal implements Terminal {
 	private programStatusSupported = false;
 	/** The support query was sent and its DA1 sentinel has not arrived yet. */
 	private programStatusQueryPending = false;
+	/** Half-written image sequence held back while tmux passthrough wrapping is active. */
+	private pendingPassthrough = "";
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
 		if (!env) return "";
@@ -479,6 +482,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	stop(): void {
+		this.flushPendingPassthrough();
 		if (this.clearProgressInterval()) {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
@@ -548,14 +552,36 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	write(data: string): void {
-		process.stdout.write(data);
+		const output = this.wrapImagesForTmux(data);
+		process.stdout.write(output);
 		if (this.writeLogPath) {
 			try {
-				fs.appendFileSync(this.writeLogPath, data, { encoding: "utf8" });
+				fs.appendFileSync(this.writeLogPath, output, { encoding: "utf8" });
 			} catch {
 				// Ignore logging errors
 			}
 		}
+	}
+
+	/**
+	 * Under tmux, image sequences only reach the outer terminal inside a DCS passthrough
+	 * (`allow-passthrough`). Wrapping happens here, at the single write choke point, so the rest
+	 * of the TUI keeps working with plain sequences. A write may split a sequence in half, so an
+	 * unterminated tail is carried over to the next write.
+	 */
+	private wrapImagesForTmux(data: string): string {
+		if (!isTmuxImagePassthroughEnabled()) return data;
+		const wrapped = wrapImageSequencesForTmux(this.pendingPassthrough + data);
+		this.pendingPassthrough = wrapped.pending;
+		return wrapped.output;
+	}
+
+	/** Emit any half-written image sequence that never completed. */
+	private flushPendingPassthrough(): void {
+		if (!this.pendingPassthrough) return;
+		const pending = this.pendingPassthrough;
+		this.pendingPassthrough = "";
+		process.stdout.write(pending);
 	}
 
 	get columns(): number {

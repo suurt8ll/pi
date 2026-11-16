@@ -67,7 +67,56 @@ function probeTmuxHyperlinks(): boolean {
 	}
 }
 
-function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean): TerminalCapabilities {
+/**
+ * Terminal emulators known to implement the Kitty graphics protocol, matched against
+ * tmux's `#{client_termname}` (the TERM of the terminal tmux is attached to, such as
+ * `xterm-ghostty`). tmux rewrites TERM and TERM_PROGRAM inside a pane, so this and the
+ * env vars the outer terminal leaks into the pane are the only hints available from
+ * inside a pane.
+ */
+const KITTY_GRAPHICS_CLIENT_TERM = /ghostty|kitty|wezterm|rio/;
+
+/**
+ * Reads whether tmux will forward DCS passthrough sequences (`allow-passthrough`) and
+ * which terminal it is attached to. Returns `undefined` when tmux cannot be queried.
+ */
+function probeTmuxPassthrough(): { allowed: boolean; clientTerm: string } | undefined {
+	try {
+		const output = execSync("tmux show -gv allow-passthrough \\; display-message -p '#{client_termname}'", {
+			encoding: "utf8",
+			timeout: 400,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const [setting = "", clientTerm = ""] = output.split("\n").map((line) => line.trim());
+		return { allowed: setting === "on" || setting === "all", clientTerm };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Checks whether image sequences can reach the outer terminal through tmux. tmux never
+ * forwards raw Kitty APC / iTerm2 OSC 1337 sequences; it only passes them on when they are
+ * wrapped in a DCS passthrough (`\x1bPtmux;...\x1b\\`) and `allow-passthrough` is enabled.
+ * `PI_TMUX_IMAGES=1|0` overrides the probe.
+ */
+export function detectTmuxImagePassthrough(): boolean {
+	const override = parseBooleanCapabilityOverride(process.env.PI_TMUX_IMAGES);
+	if (override !== undefined) return override;
+
+	const state = probeTmuxPassthrough();
+	if (!state?.allowed) return false;
+	if (KITTY_GRAPHICS_CLIENT_TERM.test(state.clientTerm.toLowerCase())) return true;
+
+	// The client termname is the multiplexer's own TERM for nested sessions (tmux in tmux,
+	// screen, ...), so fall back to env vars the outer terminal leaks into the pane.
+	return Boolean(process.env.KITTY_WINDOW_ID || process.env.WEZTERM_PANE || process.env.GHOSTTY_RESOURCES_DIR);
+}
+
+function detectCapabilitiesFromEnvironment(
+	tmuxForwardsHyperlink: () => boolean,
+	tmuxForwardsImages: () => boolean,
+): TerminalCapabilities {
 	const termProgram = process.env.TERM_PROGRAM?.toLowerCase() || "";
 	const terminalEmulator = process.env.TERMINAL_EMULATOR?.toLowerCase() || "";
 	const term = process.env.TERM?.toLowerCase() || "";
@@ -75,10 +124,15 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 	const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit" || term.endsWith("-direct");
 	const isWindowsConsole = process.platform === "win32";
 
-	// Emit OSC 8 hyperlinks only when tmux confirms it forwards.
-	// Image protocols are unreliable under tmux, so leave `images: null`.
+	// Emit OSC 8 hyperlinks only when tmux confirms it forwards, and images only when the
+	// client terminal speaks the Kitty protocol and tmux forwards the passthrough wrapper
+	// (see wrapImageSequencesForTmux).
 	if (process.env.TMUX || term.startsWith("tmux")) {
-		return { images: null, trueColor: hasTrueColorHint, hyperlinks: tmuxForwardsHyperlink() };
+		return {
+			images: tmuxForwardsImages() ? "kitty" : null,
+			trueColor: hasTrueColorHint,
+			hyperlinks: tmuxForwardsHyperlink(),
+		};
 	}
 
 	// screen does not forward OSC 8 hyperlinks, so keep them off there.
@@ -157,10 +211,14 @@ function parseBooleanCapabilityOverride(value: string | undefined): boolean | un
 	return value === "1" ? true : value === "0" ? false : undefined;
 }
 
-export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks): TerminalCapabilities {
+export function detectCapabilities(
+	tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks,
+	tmuxForwardsImages: () => boolean = detectTmuxImagePassthrough,
+): TerminalCapabilities {
 	const hyperlinks = parseBooleanCapabilityOverride(process.env.PI_HYPERLINKS);
 	const detected = detectCapabilitiesFromEnvironment(
 		hyperlinks === undefined ? tmuxForwardsHyperlink : () => hyperlinks,
+		tmuxForwardsImages,
 	);
 	const imageProtocol = process.env.PI_IMAGE_PROTOCOL?.toLowerCase();
 	const images =
@@ -195,6 +253,20 @@ export function getTerminalColorMode(capabilities: TerminalCapabilities = getCap
 
 export function resetCapabilitiesCache(): void {
 	cachedCapabilities = null;
+	cachedTmuxImagePassthrough = undefined;
+}
+
+let cachedTmuxImagePassthrough: boolean | undefined;
+
+/**
+ * Whether the TUI must wrap image sequences in a tmux DCS passthrough. Memoized because it
+ * runs `tmux` and is consulted on every terminal write.
+ */
+export function isTmuxImagePassthroughEnabled(): boolean {
+	if (!(process.env.TMUX || process.env.TERM?.toLowerCase().startsWith("tmux"))) return false;
+	if (!getCapabilities().images) return false;
+	cachedTmuxImagePassthrough ??= detectTmuxImagePassthrough();
+	return cachedTmuxImagePassthrough;
 }
 
 /** Override selected auto-detected capabilities. */
@@ -217,6 +289,166 @@ export function setCapabilities(caps: TerminalCapabilities): void {
 
 const KITTY_PREFIX = "\x1b_G";
 const ITERM2_PREFIX = "\x1b]1337;File=";
+const TMUX_PASSTHROUGH_PREFIX = "\x1bPtmux;";
+const TMUX_PASSTHROUGH_SUFFIX = "\x1b\\";
+/** Safety valve: an image sequence this large is emitted unwrapped instead of held back. */
+const MAX_PENDING_PASSTHROUGH_CHARS = 8 * 1024 * 1024;
+
+/** Wrap a terminal sequence in a tmux DCS passthrough so tmux forwards it verbatim. */
+export function wrapTmuxPassthrough(sequence: string): string {
+	return `${TMUX_PASSTHROUGH_PREFIX}${sequence.replaceAll("\x1b", "\x1b\x1b")}${TMUX_PASSTHROUGH_SUFFIX}`;
+}
+
+/** Index just past the end of the image sequence starting at `start`, or undefined if incomplete. */
+function findImageSequenceEnd(data: string, start: number): number | undefined {
+	if (data.startsWith(KITTY_PREFIX, start)) {
+		const stringTerminator = data.indexOf("\x1b\\", start + KITTY_PREFIX.length);
+		return stringTerminator === -1 ? undefined : stringTerminator + 2;
+	}
+	// iTerm2 OSC 1337 file sequence: terminated by BEL or ST, whichever comes first.
+	const bel = data.indexOf("\x07", start);
+	const stringTerminator = data.indexOf("\x1b\\", start);
+	if (bel === -1 && stringTerminator === -1) return undefined;
+	if (stringTerminator === -1) return bel + 1;
+	if (bel === -1) return stringTerminator + 2;
+	return Math.min(bel + 1, stringTerminator + 2);
+}
+
+/**
+ * Index just past the `\x1b\\` that terminates the passthrough starting at `start`, or undefined.
+ * Inside a passthrough body every ESC is doubled, so `\x1b\x1b` has to be consumed as a unit:
+ * a naive search for `\x1b\\` would stop at the second half of the terminator of the first
+ * wrapped sequence and cut the body in half.
+ */
+function findPassthroughEnd(data: string, start: number): number | undefined {
+	let index = start + TMUX_PASSTHROUGH_PREFIX.length;
+	while (index < data.length) {
+		if (data[index] !== "\x1b") {
+			index += 1;
+			continue;
+		}
+		if (data[index + 1] === "\x1b") {
+			index += 2;
+			continue;
+		}
+		if (data[index + 1] === "\\") return index + 2;
+		index += 1;
+	}
+	return undefined;
+}
+
+export interface WrappedImageSequences {
+	/** Data ready to write: every complete image sequence wrapped in a tmux passthrough. */
+	output: string;
+	/** Trailing fragment of an image sequence that continues in the next write. */
+	pending: string;
+}
+
+/**
+ * Cursor-position sequence a renderer emitted right before an image, optionally followed by
+ * erase/attribute sequences. tmux forwards a passthrough at parse time, before it has repainted,
+ * so the outer terminal's cursor is stale by however many rows the frame has not been flushed yet;
+ * the renderers therefore anchor every image line with an absolute CUP and we repeat that CUP
+ * inside the passthrough so the image lands where the frame says it does.
+ */
+const TRAILING_IMAGE_ANCHOR = /(\x1b\[\d+;\d+[Hf])((?:\x1b\[[\d;]*[KJm])*)$/;
+
+function findTrailingImageAnchor(output: string): string | undefined {
+	const tailStart = Math.max(0, output.length - 128);
+	return TRAILING_IMAGE_ANCHOR.exec(output.slice(tailStart))?.[1];
+}
+
+/** Control block of a Kitty APC sequence, i.e. the part between `\x1b_G` and the first `;`. */
+function kittySequenceControls(sequence: string): string | undefined {
+	if (!sequence.startsWith(KITTY_PREFIX)) return undefined;
+	const end = sequence.indexOf(";", KITTY_PREFIX.length);
+	return end === -1 ? undefined : sequence.slice(KITTY_PREFIX.length, end);
+}
+
+const KITTY_ACTION = /(?:^|,)a=[^,]*/;
+const KITTY_CHUNK_OPEN = /(?:^|,)m=1(?:,|$)/;
+const KITTY_CHUNK_CLOSE = /(?:^|,)m=0(?:,|$)/;
+
+/**
+ * Rewrite the image sequences in one terminal write into tmux DCS passthroughs.
+ *
+ * tmux does not understand the Kitty graphics protocol or iTerm2 inline images and drops those
+ * sequences; with `allow-passthrough` enabled it forwards everything inside `\x1bPtmux;...\x1b\\`
+ * verbatim (ESC bytes doubled). Callers that split writes may cut an image sequence in half, so an
+ * unterminated trailing sequence is returned as `pending` to be prepended to the next write.
+ * Data that already carries a passthrough is passed through untouched. Every image sequence also
+ * gets the renderer's absolute CUP anchor repeated inside its passthrough, since tmux forwards the
+ * passthrough before it repaints (see {@link TRAILING_IMAGE_ANCHOR}).
+ */
+export function wrapImageSequencesForTmux(
+	data: string,
+	maxPendingChars: number = MAX_PENDING_PASSTHROUGH_CHARS,
+): WrappedImageSequences {
+	let output = "";
+	let index = 0;
+	let transmitAnchor: string | undefined;
+	while (index < data.length) {
+		const kitty = data.indexOf(KITTY_PREFIX, index);
+		const iterm2 = data.indexOf(ITERM2_PREFIX, index);
+		const passthrough = data.indexOf(TMUX_PASSTHROUGH_PREFIX, index);
+		const start = Math.min(
+			kitty === -1 ? Number.POSITIVE_INFINITY : kitty,
+			iterm2 === -1 ? Number.POSITIVE_INFINITY : iterm2,
+			passthrough === -1 ? Number.POSITIVE_INFINITY : passthrough,
+		);
+		if (start === Number.POSITIVE_INFINITY) {
+			output += data.slice(index);
+			break;
+		}
+		output += data.slice(index, start);
+
+		// A caller (the main-screen renderer re-placing scrolled images) may build its own
+		// passthrough. Copy such a span verbatim instead of wrapping the sequences inside it again.
+		if (start === passthrough) {
+			const end = findPassthroughEnd(data, start);
+			if (end === undefined) {
+				const tail = data.slice(start);
+				if (tail.length > maxPendingChars) {
+					output += tail;
+					break;
+				}
+				return { output, pending: tail };
+			}
+			output += data.slice(start, end);
+			index = end;
+			continue;
+		}
+
+		const end = findImageSequenceEnd(data, start);
+		if (end === undefined) {
+			const tail = data.slice(start);
+			if (tail.length > maxPendingChars) {
+				output += tail;
+				break;
+			}
+			return { output, pending: tail };
+		}
+
+		// tmux forwards each chunk of a chunked transmission as it parses it, interleaved with its own
+		// repaints, so by the time the last chunk completes and the terminal displays the image the
+		// outer cursor has moved away from the row the frame put it on. Remember the anchor of the
+		// opening chunk and re-assert it before every continuation chunk (the payload only paints on
+		// the closing one, but the cursor has to be right by then).
+		const sequence = data.slice(start, end);
+		const controls = kittySequenceControls(sequence);
+		const anchor = findTrailingImageAnchor(output);
+		if (controls !== undefined && KITTY_ACTION.test(controls) && KITTY_CHUNK_OPEN.test(controls)) {
+			transmitAnchor = anchor;
+		}
+		const continuationAnchor = controls !== undefined && !KITTY_ACTION.test(controls) ? transmitAnchor : undefined;
+		output += wrapTmuxPassthrough(`${anchor ?? continuationAnchor ?? ""}${sequence}`);
+		if (controls !== undefined && KITTY_CHUNK_CLOSE.test(controls)) {
+			transmitAnchor = undefined;
+		}
+		index = end;
+	}
+	return { output, pending: "" };
+}
 
 export function isImageLine(line: string): boolean {
 	// Fast path: sequence at line start (single-row images)
@@ -441,12 +673,44 @@ export function getKittyImagePlacementRows(line: string): number | undefined {
 	return getRegisteredKittyImageMetadataFromControls(controls)?.rows;
 }
 
-/** Build a placement-only command for an image line emitted by {@link renderImage}. */
-export function getKittyImagePlacement(line: string): KittyImagePlacement | undefined {
+/** Which part of an image to show, in image rows counted from the top of the image. */
+export interface KittyImageCrop {
+	/** Rows scrolled out above the visible area. */
+	hiddenRows: number;
+	/** Rows to show, counted from the first visible one. */
+	visibleRows: number;
+}
+
+/**
+ * Source rectangle (pixels) and target row count for showing part of an image: the Kitty protocol
+ * crops with `y`/`h` in pixels and scales the result into `r` rows.
+ */
+function kittyImageSourceCrop(
+	metadata: KittyImageMetadata,
+	hiddenRows: number,
+	visibleRows: number,
+): { y: number; h: number; r: number } | undefined {
+	if (hiddenRows < 0 || hiddenRows >= metadata.rows || visibleRows <= 0) return undefined;
+	const croppedRows = Math.min(visibleRows, metadata.rows - hiddenRows);
+	const sourceY = Math.floor((metadata.heightPx * hiddenRows) / metadata.rows);
+	const sourceEnd = Math.ceil((metadata.heightPx * (hiddenRows + croppedRows)) / metadata.rows);
+	const sourceHeight = Math.max(1, Math.min(metadata.heightPx, sourceEnd) - sourceY);
+	return { y: sourceY, h: sourceHeight, r: croppedRows };
+}
+
+/**
+ * Build a placement-only command for an image line emitted by {@link renderImage}.
+ *
+ * With `crop`, the placement shows only that part of the already-uploaded image: terminals honour a
+ * source rectangle on a placement, so this clips an image without retransmitting its payload.
+ */
+export function getKittyImagePlacement(line: string, crop?: KittyImageCrop): KittyImagePlacement | undefined {
 	const match = /\x1b_G([^;]*);/.exec(line);
 	if (!match) return undefined;
 	const metadata = getRegisteredKittyImageMetadataFromControls(match[1]);
 	if (!metadata) return undefined;
+	const sourceCrop = crop ? kittyImageSourceCrop(metadata, crop.hiddenRows, crop.visibleRows) : undefined;
+	if (crop && !sourceCrop) return undefined;
 
 	let commandStart = match.index;
 	let commandControls = match[1];
@@ -463,16 +727,22 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 		commandControls = line.slice(commandStart + KITTY_PREFIX.length, controlsEnd);
 	}
 
-	const controls = match[1]
+	let controls = match[1]
 		.split(",")
 		.filter((control) => KITTY_PLACEMENT_CONTROL_KEYS.has(control.split("=", 1)[0] ?? ""));
+	let rows = getKittyImageRowsFromControls(match[1], metadata.rows);
+	if (sourceCrop) {
+		controls = controls.filter((control) => !/^[yhr]=/.test(control));
+		controls.push(`y=${sourceCrop.y}`, `h=${sourceCrop.h}`, `r=${sourceCrop.r}`);
+		rows = sourceCrop.r;
+	}
 	const sequence = `\x1b_Ga=p,q=2,${controls.join(",")}\x1b\\`;
 	return {
 		imageId: metadata.imageId,
 		transmissionGeneration: metadata.transmissionGeneration,
 		transmissionBytes: transmissionEnd - match.index,
 		estimatedDecodedBytes: metadata.widthPx * metadata.heightPx * 4,
-		rows: getKittyImageRowsFromControls(match[1], metadata.rows),
+		rows,
 		sequence,
 		replacementLine: `${line.slice(0, match.index)}${sequence}${line.slice(transmissionEnd)}`,
 	};
@@ -481,14 +751,12 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 export function cropKittyImageLine(line: string, hiddenRows: number, visibleRows: number): string {
 	const metadata = getKittyImageMetadata(line);
 	const match = /\x1b_G([^;]*);/.exec(line);
-	if (!metadata || !match || hiddenRows < 0 || hiddenRows >= metadata.rows || visibleRows <= 0) return line;
-	const croppedRows = Math.min(visibleRows, metadata.rows - hiddenRows);
-	if (hiddenRows === 0 && croppedRows === metadata.rows) return line;
-	const sourceY = Math.floor((metadata.heightPx * hiddenRows) / metadata.rows);
-	const sourceEnd = Math.ceil((metadata.heightPx * (hiddenRows + croppedRows)) / metadata.rows);
-	const sourceHeight = Math.max(1, Math.min(metadata.heightPx, sourceEnd) - sourceY);
+	if (!metadata || !match) return line;
+	const sourceCrop = kittyImageSourceCrop(metadata, hiddenRows, visibleRows);
+	if (!sourceCrop) return line;
+	if (hiddenRows === 0 && sourceCrop.r === metadata.rows) return line;
 	const controls = match[1].split(",").filter((control) => !/^[yhr]=/.test(control));
-	controls.push(`y=${sourceY}`, `h=${sourceHeight}`, `r=${croppedRows}`);
+	controls.push(`y=${sourceCrop.y}`, `h=${sourceCrop.h}`, `r=${sourceCrop.r}`);
 	return `${line.slice(0, match.index)}\x1b_G${controls.join(",")};${line.slice(match.index + match[0].length)}`;
 }
 

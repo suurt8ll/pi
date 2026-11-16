@@ -1,7 +1,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
+import {
+	deleteAllKittyPlacements,
+	deleteKittyImage,
+	getKittyImageMetadata,
+	getKittyImagePlacement,
+	getMaxKittyImageRows,
+	isImageLine,
+	isTmuxImagePassthroughEnabled,
+	wrapTmuxPassthrough,
+} from "./terminal-image.ts";
 import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
 
@@ -188,6 +197,62 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return ids;
 	}
 
+	/**
+	 * Under tmux, pin an image line to its absolute screen row. tmux forwards a passthrough before it
+	 * repaints, so the outer terminal's cursor is stale; wrapImageSequencesForTmux repeats this
+	 * sequence inside the passthrough. Without passthrough the relative cursor moves are enough.
+	 */
+	private imageAnchor(screenRow: number): string {
+		return isTmuxImagePassthroughEnabled() ? `\x1b[${Math.max(1, screenRow + 1)};1H` : "";
+	}
+
+	/**
+	 * Re-place the images that are visible in the viewport after the transcript scrolled.
+	 *
+	 * tmux scrolls text but cannot move a graphics placement, so under tmux an image stays on the
+	 * screen row it was first drawn on and text scrolls across it. Deleting the placements and
+	 * re-issuing placement-only commands (`a=p`, no payload retransmission) puts them back where the
+	 * frame says they belong. The whole batch is one passthrough so tmux's own cursor model is
+	 * untouched, and the trailing CUP restores the outer cursor to the row tmux believes it is on
+	 * (the relative moves `positionHardwareCursor` emits afterwards then line up again).
+	 */
+	private rebuildKittyImagePlacements(
+		lines: string[],
+		viewportTop: number,
+		height: number,
+		cursorRow: number,
+	): string {
+		let body = deleteAllKittyPlacements();
+		const end = Math.min(viewportTop + height, lines.length);
+
+		// An image whose first line scrolled above the viewport is not gone yet: its lower part is still
+		// on screen. A placement honours a source rectangle, so re-place the visible remainder on the top
+		// row instead of dropping the image in one step (no payload retransmission). Only one image can
+		// straddle the top edge, since image rows are reserved for the image that owns them.
+		const straddleStart = Math.max(0, viewportTop - getMaxKittyImageRows());
+		for (let i = viewportTop - 1; i >= straddleStart; i--) {
+			const line = lines[i] ?? "";
+			const metadata = getKittyImageMetadata(line);
+			if (!metadata) continue;
+			const hiddenRows = viewportTop - i;
+			if (hiddenRows >= metadata.rows) continue;
+			const placement = getKittyImagePlacement(line, {
+				hiddenRows,
+				visibleRows: Math.min(height, metadata.rows - hiddenRows),
+			});
+			if (placement) body += `\x1b[1;1H${placement.sequence}`;
+			break;
+		}
+
+		for (let i = Math.max(0, viewportTop); i < end; i++) {
+			const placement = getKittyImagePlacement(lines[i] ?? "");
+			if (!placement) continue;
+			body += `\x1b[${i - viewportTop + 1};1H${placement.sequence}`;
+		}
+		body += `\x1b[${Math.max(1, Math.min(height, cursorRow - viewportTop + 1))};1H`;
+		return wrapTmuxPassthrough(body);
+	}
+
 	private deleteKittyImages(ids: Iterable<number>): string {
 		let buffer = "";
 		for (const id of ids) {
@@ -287,6 +352,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				output.append(this.deleteKittyImages(this.previousKittyImageIds));
 				output.append("\x1b[2J\x1b[H\x1b[3J"); // Clear screen, home, then clear scrollback
 			}
+			// The terminal scrolls while the frame is written, so line i ends up this far up the screen.
+			const fullViewportTop = Math.max(0, newLines.length - height);
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) output.append("\r\n");
 				const line = newLines[i];
@@ -297,11 +364,13 @@ export class TuiMainScreen extends TuiBase implements TUI {
 						output.append("\r\n");
 					}
 					output.append(`\x1b[${imageReservedRows - 1}A`);
+					output.append(this.imageAnchor(i - fullViewportTop));
 					output.append(line);
 					output.append(`\x1b[${imageReservedRows - 1}B`);
 					i += imageReservedRows - 1;
 					continue;
 				}
+				if (isImage) output.append(this.imageAnchor(i - fullViewportTop));
 				output.append(line);
 			}
 			output.append("\x1b[?2026l"); // End synchronized output
@@ -464,6 +533,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
 		output.append("\x1b[?2026h"); // Begin synchronized output
 		output.append(this.deleteChangedKittyImages(firstChanged, lastChanged));
+		const initialViewportTop = prevViewportTop;
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
 		if (moveTargetRow > prevViewportBottom) {
@@ -512,6 +582,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 					output.append("\r\n\x1b[2K");
 				}
 				output.append(`\x1b[${imageReservedRows - 1}A`);
+				output.append(this.imageAnchor(imageStartScreenRow));
 				output.append(line);
 				output.append(`\x1b[${imageReservedRows - 1}B`);
 				i += imageReservedRows - 1;
@@ -547,6 +618,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				].join("\n");
 				throw new Error(errorMsg);
 			}
+			if (isImage) output.append(this.imageAnchor(i - viewportTop));
 			output.append(line);
 		}
 
@@ -554,6 +626,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		let finalCursorRow = renderEnd;
 
 		// If we had more lines before, clear them and move cursor back
+		let scrollDuringClear = 0;
 		if (this.previousLines.length > newLines.length) {
 			// Move to end of new content first if we stopped before it
 			if (renderEnd < newLines.length - 1) {
@@ -562,6 +635,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				finalCursorRow = newLines.length - 1;
 			}
 			const extraLines = this.previousLines.length - newLines.length;
+			if (isTmuxImagePassthroughEnabled()) {
+				// Writing those lines from the bottom of the screen scrolls everything above them up.
+				const cursorScreenRow = Math.min(
+					height - 1,
+					finalCursorRow - Math.max(prevViewportTop, finalCursorRow - height + 1),
+				);
+				scrollDuringClear = Math.max(0, cursorScreenRow + extraLines - (height - 1));
+			}
 			for (let i = newLines.length; i < this.previousLines.length; i++) {
 				output.append("\r\n\x1b[2K");
 			}
@@ -570,6 +651,17 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		}
 
 		output.append("\x1b[?2026l"); // End synchronized output
+
+		// tmux forwards a passthrough at parse time and never moves a graphics placement, so an image
+		// stays pinned to the screen row it was first drawn on while the text scrolls underneath it.
+		// Once the viewport has scrolled, re-place the visible images after tmux's own repaint.
+		//
+		// Rendering appended lines scrolls the terminal without updating `viewportTop`, so the final
+		// viewport top is derived the same way the field itself is updated below.
+		const finalViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1) + scrollDuringClear;
+		if (finalViewportTop !== initialViewportTop && isTmuxImagePassthroughEnabled()) {
+			output.append(this.rebuildKittyImagePlacements(newLines, finalViewportTop, height, finalCursorRow));
+		}
 
 		if (process.env.PI_TUI_DEBUG === "1") {
 			const debugDir = "/tmp/tui";
@@ -609,7 +701,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hardwareCursorRow = finalCursorRow;
 		// Track terminal's working area (grows but doesn't shrink unless cleared)
 		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
-		this.previousViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1);
+		this.previousViewportTop = finalViewportTop;
 
 		// Position hardware cursor for IME
 		this.positionHardwareCursor(cursorPos, newLines.length);
