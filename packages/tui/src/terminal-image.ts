@@ -261,8 +261,16 @@ let cachedTmuxImagePassthrough: boolean | undefined;
 /**
  * Whether the TUI must wrap image sequences in a tmux DCS passthrough. Memoized because it
  * runs `tmux` and is consulted on every terminal write.
+ *
+ * `PI_TMUX_IMAGES=1|0` is authoritative and short-circuits the env gate as well as the probe:
+ * a process running inside a container can have no tmux trace at all — no `TMUX`, docker
+ * rewrites `TERM` to `xterm`, and the image carries no `tmux` binary and no socket to query —
+ * so the launcher that *is* the tmux client has to be able to say "wrap them" on its own. The
+ * `images` gate still applies: there is nothing to wrap for a terminal that renders none.
  */
 export function isTmuxImagePassthroughEnabled(): boolean {
+	const override = parseBooleanCapabilityOverride(process.env.PI_TMUX_IMAGES);
+	if (override !== undefined) return override && Boolean(getCapabilities().images);
 	if (!(process.env.TMUX || process.env.TERM?.toLowerCase().startsWith("tmux"))) return false;
 	if (!getCapabilities().images) return false;
 	cachedTmuxImagePassthrough ??= detectTmuxImagePassthrough();
